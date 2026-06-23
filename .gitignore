@@ -1,0 +1,20 @@
+# Snowflake CLI build output
+output/
+
+# Local Streamlit secrets — NEVER commit
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,18 @@
+definition_version: 2
+entities:
+  cowork_cost_monitor:
+    type: streamlit
+    identifier:
+      name: COWORK_COST_MONITOR
+      database: STREAMLIT_COWORK   # <-- AJUSTAR: database destino
+      schema: APP                  # <-- AJUSTAR: schema destino (crear antes si no existe)
+    query_warehouse: APP_WH        # <-- AJUSTAR: warehouse para queries (XS basta)
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    compute_pool: SYSTEM_COMPUTE_POOL_CPU   # <-- AJUSTAR: SHOW PARAMETERS LIKE 'DEFAULT_STREAMLIT_COMPUTE_POOL' IN ACCOUNT
+    external_access_integrations:
+      - PYPI_ACCESS_INTEGRATION    # <-- AJUSTAR: EAI de PyPI (ver README)
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - pyproject.toml
+      - .streamlit/config.toml
