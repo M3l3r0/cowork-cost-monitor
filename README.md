@@ -5,6 +5,14 @@ Streamlit app para monitorizar de forma completa los costes de **Snowflake CoWor
 (compute)** atribuibles a cada usuario, incluso cuando CoWork usa el warehouse del propio
 usuario (sin warehouse dedicado).
 
+## Capturas
+
+### Simulador de Costes
+![Simulador de Costes](docs/simulador-costes.png)
+
+### Tendencia Diaria con alertas de umbral
+![Tendencia Diaria](docs/tendencia-diaria.png)
+
 ## Que muestra
 
 | Pestana | Contenido |
