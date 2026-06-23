@@ -23,6 +23,8 @@ usuario (sin warehouse dedicado).
 | **Tendencia Diaria** | Evolucion temporal con alertas de umbral |
 | **Comparativa Periodos** | Periodo actual vs anterior con deltas y % cambio |
 | **Simulador de Costes** | Proyeccion de coste segun preguntas/mes y precio del credito |
+| **Chargeback por Equipo** | Atribucion del gasto a centros de coste via tags de usuario |
+| **Budgets y Alertas** | Generador de SQL para crear alertas y budgets nativos de Snowflake |
 | **Como Monitorizar Costes** | Documentacion de vistas, queries y recomendaciones |
 
 ## Como se calcula el coste

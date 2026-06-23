@@ -164,13 +164,15 @@ threshold_day = st.sidebar.number_input(
 
 # --- Tabs principales ---
 (tab_overview, tab_user_cost, tab_model, tab_trend,
- tab_compare, tab_sim, tab_explain) = st.tabs([
+ tab_compare, tab_sim, tab_chargeback, tab_budget, tab_explain) = st.tabs([
     "Resumen",
     "Coste Completo por Usuario",
     "Desglose Modelo/Servicio",
     "Tendencia Diaria",
     "Comparativa Periodos",
     "Simulador de Costes",
+    "Chargeback por Equipo",
+    "Budgets y Alertas",
     "Como Monitorizar Costes",
 ])
 
@@ -675,7 +677,221 @@ with tab_sim:
 
 
 # =============================================================================
-# TAB 7: EXPLICACION - COMO MONITORIZAR COSTES
+# TAB 7: CHARGEBACK POR EQUIPO (TAGS)
+# =============================================================================
+with tab_chargeback:
+    st.subheader(f"Chargeback por Equipo · {start_str} → {end_str}")
+    st.info("""
+    Atribuye el gasto de CoWork a equipos / centros de coste usando **tags de usuario**.
+    Requiere que los usuarios tengan asignado un tag (ej. `COST_CENTER`, `TEAM`, `DEPARTMENT`)
+    visible en `SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES`.
+    """)
+
+    # Descubrir tags disponibles sobre el dominio USER
+    df_tags = conn.query("""
+        SELECT DISTINCT TAG_NAME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+        WHERE DOMAIN = 'USER'
+        ORDER BY TAG_NAME
+    """, ttl=3600)
+
+    if df_tags.empty:
+        st.warning(
+            "No se encontraron tags aplicados a usuarios en `TAG_REFERENCES`.\n\n"
+            "Para habilitar el chargeback, crea y asigna un tag a tus usuarios, por ejemplo:")
+        st.code("""-- Crear el tag (una vez)
+CREATE TAG IF NOT EXISTS GOVERNANCE.TAGS.COST_CENTER;
+
+-- Asignar a usuarios
+ALTER USER JKOWAL SET TAG GOVERNANCE.TAGS.COST_CENTER = 'FINANCE';
+ALTER USER ASMITH SET TAG GOVERNANCE.TAGS.COST_CENTER = 'ENGINEERING';""", language="sql")
+    else:
+        tag_options = df_tags["TAG_NAME"].tolist()
+        sel_tag = st.selectbox("Tag de usuario para agrupar", tag_options)
+
+        df_cb = conn.query(f"""
+            WITH user_tags AS (
+                SELECT OBJECT_NAME AS user_name, TAG_VALUE
+                FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+                WHERE DOMAIN = 'USER'
+                  AND TAG_NAME = '{sel_tag}'
+            ),
+            si_usage AS (
+                SELECT USER_NAME, REQUEST_ID, TOKEN_CREDITS, TOKENS
+                FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_INTELLIGENCE_USAGE_HISTORY
+                WHERE START_TIME >= '{start_str}'
+                  AND START_TIME < '{end_str}'
+            )
+            SELECT
+                COALESCE(ut.TAG_VALUE, 'SIN_TAG') AS cost_center,
+                ROUND(SUM(si.TOKEN_CREDITS), 4) AS total_credits,
+                SUM(si.TOKENS) AS total_tokens,
+                COUNT(DISTINCT si.REQUEST_ID) AS request_count,
+                COUNT(DISTINCT si.USER_NAME) AS unique_users
+            FROM si_usage si
+            LEFT JOIN user_tags ut ON si.USER_NAME = ut.user_name
+            GROUP BY cost_center
+            ORDER BY total_credits DESC
+        """, ttl=600)
+
+        if df_cb.empty or df_cb["TOTAL_CREDITS"].isnull().all():
+            st.info("Sin datos de CoWork en este periodo para atribuir.")
+        else:
+            df_cb = to_float_cols(df_cb, ["TOTAL_CREDITS", "TOTAL_TOKENS", "REQUEST_COUNT", "UNIQUE_USERS"])
+            total_cb = df_cb["TOTAL_CREDITS"].sum()
+            untagged = df_cb[df_cb["COST_CENTER"] == "SIN_TAG"]["TOTAL_CREDITS"].sum()
+
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(kpi_card("Centros de coste", df_cb[df_cb["COST_CENTER"] != "SIN_TAG"].shape[0]),
+                        unsafe_allow_html=True)
+            c2.markdown(kpi_card("Total Credits", f"{total_cb:.4f}"), unsafe_allow_html=True)
+            pct_untag = (untagged / total_cb * 100) if total_cb else 0
+            c3.markdown(kpi_card("Sin tag", f"{pct_untag:.1f}%"), unsafe_allow_html=True)
+
+            if untagged > 0:
+                st.markdown(
+                    f'<span class="alert-badge">⚠ {pct_untag:.1f}% del gasto pertenece a usuarios '
+                    f'sin el tag "{sel_tag}" — revisa la cobertura de etiquetado</span>',
+                    unsafe_allow_html=True)
+
+            st.divider()
+            cc1, cc2 = st.columns([1, 1])
+            with cc1:
+                chart_cb = alt.Chart(df_cb).mark_arc(innerRadius=55).encode(
+                    theta="TOTAL_CREDITS:Q",
+                    color=alt.Color("COST_CENTER:N", scale=alt.Scale(scheme="blues"),
+                                    title="Centro de coste"),
+                    tooltip=["COST_CENTER", "TOTAL_CREDITS", "UNIQUE_USERS"],
+                ).properties(height=320, title="Distribucion por centro de coste")
+                st.altair_chart(chart_cb, use_container_width=True)
+            with cc2:
+                bar_cb = alt.Chart(df_cb).mark_bar(color="#29B5E8", cornerRadiusEnd=4).encode(
+                    x=alt.X("TOTAL_CREDITS:Q", title="Token Credits"),
+                    y=alt.Y("COST_CENTER:N", sort="-x", title="Centro de coste"),
+                    tooltip=["COST_CENTER", "TOTAL_CREDITS", "REQUEST_COUNT", "UNIQUE_USERS"],
+                ).properties(height=320, title="Ranking de gasto")
+                st.altair_chart(bar_cb, use_container_width=True)
+
+            disp_cb = df_cb.rename(columns={
+                "COST_CENTER": "Centro de coste",
+                "TOTAL_CREDITS": "Token Credits",
+                "TOTAL_TOKENS": "Tokens",
+                "REQUEST_COUNT": "Requests",
+                "UNIQUE_USERS": "Usuarios",
+            })
+            st.dataframe(disp_cb, use_container_width=True, hide_index=True)
+            csv_download(disp_cb, "chargeback_equipo.csv")
+
+
+# =============================================================================
+# TAB 8: BUDGETS Y ALERTAS (GENERADOR DE SQL)
+# =============================================================================
+with tab_budget:
+    st.subheader("Budgets y Alertas Nativas")
+    st.info("""
+    Las alertas de la barra lateral son **visuales** (solo se ven al abrir la app). Para recibir
+    avisos automaticos, crea un **Budget** o una **Alert** nativa de Snowflake. Esta pestana
+    genera el SQL listo para copiar y ejecutar en un worksheet con un rol con privilegios
+    (`ACCOUNTADMIN` o un rol con `CREATE ALERT` / `EXECUTE MANAGED ALERT` y acceso a budgets).
+    """)
+
+    st.markdown("### 1. Alerta diaria sobre gasto de CoWork")
+    st.caption("Notifica cuando el gasto de token credits de un dia supera un umbral.")
+
+    a1, a2, a3 = st.columns(3)
+    alert_db = a1.text_input("Database.Schema destino", value="STREAMLIT_COWORK.APP", key="alert_db")
+    alert_wh = a2.text_input("Warehouse para la alerta", value="APP_WH", key="alert_wh")
+    alert_threshold = a3.number_input("Umbral diario (credits)", min_value=0.0,
+                                      value=float(threshold_day), step=1.0, key="alert_thr")
+    notif_int = st.text_input(
+        "Notification integration (email/Slack)", value="MY_EMAIL_NOTIFICATION_INT",
+        help="Debe existir previamente. Ver mas abajo como crear una de email.")
+    alert_email = st.text_input("Email(s) destino (separados por coma)",
+                                value="finops@empresa.com")
+
+    alert_sql = f"""-- Alerta: gasto diario de CoWork por encima de {alert_threshold} credits
+CREATE OR REPLACE ALERT {alert_db}.COWORK_DAILY_COST_ALERT
+  WAREHOUSE = {alert_wh}
+  SCHEDULE = 'USING CRON 0 8 * * * UTC'   -- cada dia a las 08:00 UTC
+  IF (EXISTS (
+        SELECT 1
+        FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWFLAKE_INTELLIGENCE_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('day', -1, CURRENT_DATE())
+          AND START_TIME <  CURRENT_DATE()
+        GROUP BY DATE(START_TIME)
+        HAVING SUM(TOKEN_CREDITS) > {alert_threshold}
+      ))
+  THEN CALL SYSTEM$SEND_EMAIL(
+        '{notif_int}',
+        '{alert_email}',
+        'Alerta de coste CoWork',
+        'El gasto de CoWork ayer supero {alert_threshold} credits. Revisa el dashboard.'
+  );
+
+-- Activar la alerta (las alertas se crean suspendidas)
+ALTER ALERT {alert_db}.COWORK_DAILY_COST_ALERT RESUME;"""
+
+    st.code(alert_sql, language="sql")
+
+    with st.expander("¿No tienes una notification integration de email? Crea una asi"):
+        st.code("""CREATE OR REPLACE NOTIFICATION INTEGRATION MY_EMAIL_NOTIFICATION_INT
+  TYPE = EMAIL
+  ENABLED = TRUE
+  ALLOWED_RECIPIENTS = ('finops@empresa.com');
+
+-- El email destino debe ser de un usuario verificado en la cuenta.""", language="sql")
+
+    st.divider()
+    st.markdown("### 2. Budget mensual para CoWork")
+    st.caption("Un budget monitoriza el gasto y notifica al superar el limite definido.")
+
+    b1, b2, b3 = st.columns(3)
+    budget_db = b1.text_input("Database.Schema del budget", value="STREAMLIT_COWORK.APP", key="bud_db")
+    budget_limit = b2.number_input("Limite mensual (credits)", min_value=0.0, value=500.0,
+                                   step=50.0, key="bud_limit")
+    budget_email = b3.text_input("Email de notificacion", value="finops@empresa.com", key="bud_email")
+
+    budget_sql = f"""-- Budget personalizado para monitorizar el gasto de CoWork
+-- Requiere un rol con SNOWFLAKE.BUDGET_CREATOR y CREATE SNOWFLAKE.CORE.BUDGET en el schema.
+-- CoWork esta soportado por budgets como servicio AI_SERVICES.
+
+-- 1. La notification integration debe poder ser usada por la app SNOWFLAKE:
+GRANT USAGE ON INTEGRATION {notif_int} TO APPLICATION snowflake;
+
+-- 2. Crear el budget
+CREATE OR REPLACE SNOWFLAKE.CORE.BUDGET {budget_db}.COWORK_BUDGET();
+
+-- 3. Limite mensual (en credits)
+CALL {budget_db}.COWORK_BUDGET!SET_SPENDING_LIMIT({budget_limit});
+
+-- 4. Notificaciones por email (integration + email verificado)
+CALL {budget_db}.COWORK_BUDGET!SET_EMAIL_NOTIFICATIONS(
+  '{notif_int}',
+  '{budget_email}'
+);
+
+-- Nota: el budget de cuenta (snowflake.local.account_root_budget) ya monitoriza TODO
+-- el gasto, incluido CoWork (AI_SERVICES). Para acotar un custom budget al compute de
+-- CoWork, asigna un WAREHOUSE dedicado a las instancias y agregalo al budget:
+--   GRANT APPLYBUDGET ON WAREHOUSE COWORK_WH TO ROLE <budget_owner>;
+--   CALL {budget_db}.COWORK_BUDGET!ADD_RESOURCE(
+--     SYSTEM$REFERENCE('warehouse', 'COWORK_WH', 'SESSION', 'applybudget'));"""
+
+    st.code(budget_sql, language="sql")
+
+    st.divider()
+    st.markdown("""
+    **Como desplegarlo:**
+    1. Copia el SQL de arriba.
+    2. Abre un worksheet en Snowsight con un rol con privilegios (`ACCOUNTADMIN` o equivalente).
+    3. Ajusta los nombres si hace falta y ejecuta.
+    4. Verifica la alerta con `SHOW ALERTS IN SCHEMA {db}.{schema};` y el budget con
+       `SHOW SNOWFLAKE.CORE.BUDGET INSTANCES IN ACCOUNT;`
+    """)
+
+
+# =============================================================================
+# TAB 9: EXPLICACION - COMO MONITORIZAR COSTES
 # =============================================================================
 with tab_explain:
     st.subheader("Como Monitorizar los Costes de Snowflake CoWork")
